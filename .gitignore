@@ -1,0 +1,12 @@
+# big binaries -> attach the exe to a GitHub Release instead
+*.exe
+tools/
+Downloads/
+build/
+dist/
+*.spec
+__pycache__/
+.installed
+.deno_tried
+source/
+Run Downloader.bat
