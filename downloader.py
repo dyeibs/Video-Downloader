@@ -30,9 +30,76 @@ FFMPEG_WHEEL = ("https://files.pythonhosted.org/packages/e5/55/1d50cdd78d862a30c
                 "imageio_ffmpeg-0.7.0-py3-none-win_amd64.whl")
 
 MP4_QUALITIES = ["Best", "2160p (4K)", "1440p", "1080p", "720p", "480p", "360p"]
-MP3_QUALITIES = ["320 kbps", "256 kbps", "192 kbps", "128 kbps"]
+MP3_QUALITIES = ["320 kbps", "256 kbps", "192 kbps", "128 kbps", "96 kbps"]
+MP3_DEFAULT = 3  # 128 kbps: small files, still sounds good
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 PROG_RE = re.compile(r"^PROG\s*([\d.]+)%\|(.*?)\|(.*?)\|(.*)$")
+SPOTIFY_RE = re.compile(r"open\.spotify\.com/(?:intl-[a-z-]+/)?(playlist|album|track)/([A-Za-z0-9]+)")
+URL_RE = re.compile(r"^[a-z][a-z0-9+.-]*://", re.I)
+UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+      "(KHTML, like Gecko) Chrome/130.0 Safari/537.36")
+
+
+def _walk(o):
+    """Yield every dict inside a JSON structure."""
+    if isinstance(o, dict):
+        yield o
+        for v in o.values():
+            yield from _walk(v)
+    elif isinstance(o, list):
+        for v in o:
+            yield from _walk(v)
+
+
+def _artists(v):
+    if isinstance(v, str):
+        return v
+    if isinstance(v, list):
+        return ", ".join(a.get("name", "") if isinstance(a, dict) else str(a) for a in v)
+    if isinstance(v, dict):  # {"items": [{"profile": {"name": ...}}]}
+        names = [d.get("name") for d in _walk(v) if isinstance(d.get("name"), str)]
+        return ", ".join(dict.fromkeys(names))
+    return ""
+
+
+def spotify_tracks(kind, sid):
+    """Read song titles + artists from Spotify's public embed page (metadata only, no audio).
+    Returns (collection_name, ["Artist - Title", ...])."""
+    import json
+    url = f"https://open.spotify.com/embed/{kind}/{sid}"
+    req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept-Language": "en"})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        html = r.read().decode("utf-8", "replace")
+    m = re.search(r'<script[^>]+id="__NEXT_DATA__"[^>]*>(.*?)</script>', html, re.S)
+    if not m:
+        raise RuntimeError("Spotify page format changed (no track data found).")
+    data = json.loads(m.group(1))
+
+    name, songs = "", []
+    for d in _walk(data):
+        tl = d.get("trackList")
+        if isinstance(tl, list) and tl:
+            name = d.get("name") or d.get("title") or ""
+            for t in tl:
+                if not isinstance(t, dict):
+                    continue
+                title = t.get("title") or t.get("name") or ""
+                artist = _artists(t.get("subtitle") or t.get("artists") or "")
+                if title:
+                    songs.append(f"{artist} - {title}" if artist else title)
+            break
+    if not songs:  # single track page
+        for d in _walk(data):
+            if d.get("type") == "track" or ("name" in d and "artists" in d):
+                title = d.get("name") or d.get("title")
+                artist = _artists(d.get("artists") or d.get("subtitle") or "")
+                if title:
+                    songs = [f"{artist} - {title}" if artist else title]
+                    name = title
+                    break
+    if not songs:
+        raise RuntimeError("Couldn't find any songs. Is the playlist public?")
+    return name, list(dict.fromkeys(songs))  # drop duplicates, keep order
 
 
 def find_js_runtimes():
@@ -97,7 +164,7 @@ class App:
         main = ttk.Frame(root, padding=10)
         main.pack(fill="both", expand=True)
 
-        ttk.Label(main, text="Video link(s) — one per line:").pack(anchor="w", **pad)
+        ttk.Label(main, text="Links (YouTube, Spotify playlist, ...) or song names like  Bon Jovi - Always  — one per line:").pack(anchor="w", **pad)
         self.urls = tk.Text(main, height=4, wrap="none", font=("Consolas", 10))
         self.urls.pack(fill="x", **pad)
         b = ttk.Frame(main)
@@ -142,6 +209,15 @@ class App:
         self.log = tk.Text(main, height=8, state="disabled", font=("Consolas", 9), bg="#f6f6f6")
         self.log.pack(fill="both", expand=True, **pad)
 
+        foot = ttk.Frame(main)
+        foot.pack(fill="x", padx=10)
+        credit = tk.Label(foot, text="Made by dyeibs  •  github.com/dyeibs", fg="#888888",
+                          cursor="hand2", font=("Segoe UI", 8))
+        credit.pack(side="right")
+        credit.bind("<Button-1>", lambda e: __import__("webbrowser").open("https://github.com/dyeibs"))
+        credit.bind("<Enter>", lambda e: credit.configure(fg="#e02832"))
+        credit.bind("<Leave>", lambda e: credit.configure(fg="#888888"))
+
         self.js = find_js_runtimes()
         root.after(100, self.poll)
         threading.Thread(target=self.setup_tools, daemon=True).start()
@@ -173,8 +249,9 @@ class App:
 
     # ---------------- UI helpers
     def on_fmt(self):
-        self.quality.configure(values=MP4_QUALITIES if self.fmt.get() == "mp4" else MP3_QUALITIES)
-        self.quality.current(0)
+        mp4 = self.fmt.get() == "mp4"
+        self.quality.configure(values=MP4_QUALITIES if mp4 else MP3_QUALITIES)
+        self.quality.current(0 if mp4 else MP3_DEFAULT)
 
     def paste(self):
         try:
@@ -257,7 +334,7 @@ class App:
     def start(self):
         urls = [u.strip() for u in self.urls.get("1.0", "end").splitlines() if u.strip()]
         if not urls:
-            messagebox.showinfo("No link", "Paste at least one video link first.")
+            messagebox.showinfo("Nothing to download", "Paste a link or type a song name first.")
             return
         os.makedirs(self.outdir.get(), exist_ok=True)
         self.cancel = False
@@ -276,12 +353,41 @@ class App:
             else:
                 p.kill()
 
-    def run(self, urls):
+    def expand(self, lines):
+        """Turn the text box into download targets:
+        - Spotify links -> each song searched on YouTube (Spotify audio is DRM-protected)
+        - other links   -> downloaded as-is
+        - plain text    -> treated as a song name and searched on YouTube"""
+        hint = "official audio" if self.fmt.get() == "mp3" else "official music video"
+        items = []
+        for line in lines:
+            sp = SPOTIFY_RE.search(line)
+            if sp:
+                kind, sid = sp.groups()
+                self.q.put(("status", f"Reading Spotify {kind}…"))
+                try:
+                    name, songs = spotify_tracks(kind, sid)
+                except Exception as e:
+                    self.q.put(("log", f"ERROR reading Spotify link: {e}"))
+                    continue
+                self.q.put(("log", f"Spotify {kind} '{name}': {len(songs)} songs, searching each on YouTube"))
+                if kind == "playlist" and len(songs) == 100:
+                    self.q.put(("log", "Note: Spotify only shows the first 100 songs of a playlist here."))
+                items += [(s, f"ytsearch1:{s} {hint}") for s in songs]
+            elif URL_RE.match(line):
+                items.append((line, line))
+            else:
+                items.append((line, f"ytsearch1:{line} {hint}"))
+        return items
+
+    def run(self, lines):
         ok_all = True
-        for i, url in enumerate(urls, 1):
+        failed = []
+        items = self.expand(lines)
+        for i, (label, url) in enumerate(items, 1):
             if self.cancel:
                 break
-            self.q.put(("log", f"[{i}/{len(urls)}] {url}"))
+            self.q.put(("log", f"[{i}/{len(items)}] {label}"))
             try:
                 self.proc = subprocess.Popen(self.build_args(url), stdout=subprocess.PIPE,
                                              stderr=subprocess.STDOUT, text=True, encoding="utf-8",
@@ -294,6 +400,11 @@ class App:
                 rc = 1
             if rc != 0 and not self.cancel:
                 ok_all = False
+                failed.append(label)
+        if not items:
+            ok_all = False
+        if failed:
+            self.q.put(("log", f"{len(failed)} failed: " + "; ".join(failed[:20])))
         if self.cancel:
             self.q.put(("status", "Cancelled."))
         elif ok_all:
